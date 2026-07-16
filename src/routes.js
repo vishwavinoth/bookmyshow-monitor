@@ -66,12 +66,7 @@ router.post('/test-alert', async (req, res) => {
       bookingUrl: config.targetUrl,
     },
   ]);
-  const snapshot = monitor.getSnapshot();
-  await whatsapp.sendAlert(messages, {
-    // Include the movie poster when a scan has already captured it.
-    imageUrl: snapshot && snapshot.posterUrl,
-    imageCaption: '🚨 Test alert — poster delivery check',
-  }); // never throws; queues if not ready
+  await whatsapp.sendAlert(messages); // never throws; queues if not ready
   const status = whatsapp.getStatus();
   res.json({
     message: status.ready
