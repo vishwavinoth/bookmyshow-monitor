@@ -56,6 +56,74 @@ async function closeBrowser() {
   }
 }
 
+/* ── Movie poster (fetched once, cached for the process lifetime) ────── */
+
+let cachedPosterUrl = null;
+let posterFetchAttempted = false;
+
+/** .../movies/<city>/<slug>/buytickets/<ET>/<date> -> .../movies/<city>/<slug>/<ET> */
+function moviePageUrlFrom(targetUrl) {
+  const m = String(targetUrl).match(/^(https?:\/\/[^/]+\/movies\/[^/]+\/[^/]+)\/buytickets\/(ET\d+)/i);
+  return m ? `${m[1]}/${m[2]}` : null;
+}
+
+/**
+ * The buy-tickets page carries no poster (its og:image is empty), but the
+ * movie detail page does. Posters don't change, so one lookup on the first
+ * scan is enough; failures just mean text-only alerts.
+ */
+async function fetchPosterUrl() {
+  if (cachedPosterUrl || posterFetchAttempted) return cachedPosterUrl;
+  posterFetchAttempted = true;
+
+  const movieUrl = moviePageUrlFrom(config.targetUrl);
+  if (!movieUrl) return null;
+
+  try {
+    const instance = await getBrowser();
+    const context = await instance.newContext({
+      userAgent: USER_AGENT,
+      viewport: { width: 1366, height: 768 },
+      locale: 'en-IN',
+      timezoneId: 'Asia/Kolkata',
+    });
+    try {
+      const target = await context.newPage();
+      // We only read meta tags / src attributes — no need to load assets.
+      await target.route('**/*', (route) => {
+        const type = route.request().resourceType();
+        if (type === 'image' || type === 'media' || type === 'font') return route.abort();
+        return route.continue();
+      });
+      await target.goto(movieUrl, { waitUntil: 'domcontentloaded', timeout: config.navTimeout });
+      await target
+        .waitForFunction(
+          () => {
+            const m = document.querySelector('meta[property="og:image"]');
+            return m && m.content;
+          },
+          { timeout: 10000 }
+        )
+        .catch(() => {});
+      cachedPosterUrl = await target.evaluate(() => {
+        const meta =
+          document.querySelector('meta[property="og:image"]') ||
+          document.querySelector('meta[name="twitter:image"]');
+        if (meta && meta.content) return meta.content;
+        const img = Array.from(document.images).find((i) => /iedb\/movies\/images/i.test(i.src));
+        return img ? img.src : null;
+      });
+      if (cachedPosterUrl) logger.info(`Movie poster found: ${cachedPosterUrl}`);
+      else logger.warn('No poster found on the movie page — alerts will be text-only');
+    } finally {
+      await context.close().catch(() => {});
+    }
+  } catch (err) {
+    logger.warn(`Poster lookup failed (${err.message}) — alerts will be text-only`);
+  }
+  return cachedPosterUrl;
+}
+
 /** Wait for dynamic content using state/selector checks, never a fixed sleep. */
 async function waitForContent(target) {
   const timeout = Math.min(config.navTimeout, 30000);
@@ -217,11 +285,25 @@ function extractFromState() {
       }))
       .filter((v) => v.name && v.shows.length);
 
+    // Movie poster from social-sharing meta tags (used in WhatsApp alerts).
+    let posterUrl = null;
+    const posterMeta =
+      document.querySelector('meta[property="og:image"]') ||
+      document.querySelector('meta[name="twitter:image"]');
+    if (posterMeta && posterMeta.content) {
+      try {
+        posterUrl = new URL(posterMeta.content, location.href).href;
+      } catch {
+        posterUrl = null;
+      }
+    }
+
     return {
       source: 'state',
       movie,
       pageLanguage: language,
       pageFormat: dimension,
+      posterUrl,
       venues,
       title: document.title,
       bodySnippet: clean(document.body.innerText).slice(0, 400),
@@ -355,11 +437,24 @@ function extractFromDom() {
     for (const [name, shows] of byVenue) venues.push({ name, bookingUrl: null, shows });
   }
 
+  let posterUrl = null;
+  const posterMeta =
+    document.querySelector('meta[property="og:image"]') ||
+    document.querySelector('meta[name="twitter:image"]');
+  if (posterMeta && posterMeta.content) {
+    try {
+      posterUrl = new URL(posterMeta.content, location.href).href;
+    } catch {
+      posterUrl = null;
+    }
+  }
+
   return {
     source: 'dom',
     movie,
     pageLanguage,
     pageFormat,
+    posterUrl,
     venues,
     title: document.title,
     bodySnippet: clean(document.body.innerText).slice(0, 400),
@@ -409,6 +504,7 @@ function buildSnapshot(raw) {
     movie,
     url: config.targetUrl,
     source: raw.source || 'unknown',
+    posterUrl: raw.posterUrl || cachedPosterUrl || null,
     theatreCount: theatres.length,
     showCount,
     theatres,
@@ -430,6 +526,9 @@ function buildSnapshot(raw) {
  * nearly as fast because the Chromium process is already warm.)
  */
 async function scrape() {
+  // One-time poster lookup (cached); adds a page load to the first scan only.
+  await fetchPosterUrl();
+
   const instance = await getBrowser();
   const context = await instance.newContext({
     userAgent: USER_AGENT,

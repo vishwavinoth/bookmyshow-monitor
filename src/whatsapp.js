@@ -10,7 +10,7 @@
  * - Disconnects trigger an automatic re-initialisation.
  */
 const path = require('path');
-const { Client, LocalAuth } = require('whatsapp-web.js');
+const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
 const logger = require('./logger');
 const { config } = require('./utils');
@@ -127,12 +127,47 @@ async function deliver(body) {
 }
 
 /**
- * Send one or more alert messages. If the client is not ready yet the
- * messages are queued (bounded) and sent as soon as it becomes ready.
+ * Send the poster image (with a short caption) to every recipient.
+ * Strictly best-effort: any failure just falls back to text-only alerts.
+ * The image is downloaded once and reused for all recipients.
+ */
+async function deliverImage(imageUrl, caption) {
+  if (!config.whatsappNumbers.length) return;
+  let media;
+  try {
+    media = await MessageMedia.fromUrl(imageUrl, { unsafeMime: true });
+  } catch (err) {
+    logger.warn(`Could not fetch poster image (${err.message}) — sending text-only alert`);
+    return;
+  }
+  let delivered = 0;
+  for (const recipient of config.whatsappNumbers) {
+    try {
+      const id = await resolveChatId(recipient);
+      await client.sendMessage(id, media, caption ? { caption } : {});
+      delivered += 1;
+    } catch (err) {
+      logger.warn(`Failed to send poster to ${recipient}: ${err.message}`);
+    }
+  }
+  if (delivered) {
+    logger.info(`Poster image sent to ${delivered}/${config.whatsappNumbers.length} recipient(s)`);
+  }
+}
+
+/**
+ * Send one or more alert messages, optionally preceded by a poster image
+ * (options: { imageUrl, imageCaption }). If the client is not ready yet the
+ * text messages are queued (bounded) and sent as soon as it becomes ready;
+ * the image is skipped when not ready — it is decoration, not data.
  * Never throws — a notification failure must not break the monitor loop.
  */
-async function sendAlert(messages) {
+async function sendAlert(messages, options = {}) {
   const list = Array.isArray(messages) ? messages : [messages];
+
+  if (options.imageUrl && ready) {
+    await deliverImage(options.imageUrl, options.imageCaption || '');
+  }
   for (const body of list) {
     if (!ready) {
       if (pending.length < MAX_QUEUE) {

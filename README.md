@@ -161,6 +161,9 @@ Only the **latest snapshot is kept in memory** (no database, no files):
   re-alerted.
 - All new items found in a single scan are **combined into one WhatsApp
   message** (split only if it would exceed WhatsApp's practical length limit).
+- Alerts lead with the **movie poster** (taken from the page's `og:image`
+  tag) plus a short caption, followed by the detailed text. If the poster
+  can't be fetched, the alert simply arrives text-only.
 
 Example alert:
 

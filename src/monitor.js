@@ -156,7 +156,10 @@ async function performScan(trigger = 'scheduled') {
     if (alertItems.length) {
       logger.info(`New shows detected: ${alertItems.length} — sending WhatsApp alert`);
       const messages = formatAlertMessages(snapshot.movie, alertItems);
-      await whatsapp.sendAlert(messages);
+      await whatsapp.sendAlert(messages, {
+        imageUrl: snapshot.posterUrl,
+        imageCaption: `🚨 *${snapshot.movie}* — ${alertItems.length} new update(s) detected`,
+      });
     } else {
       logger.info('No new shows or availability changes detected');
     }
