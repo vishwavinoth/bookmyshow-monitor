@@ -1,4 +1,15 @@
+<p align="center">
+  <img src="assets/banner.svg" alt="BookMyShow Monitor — instant WhatsApp alerts when new shows, theatres or seats open up" width="100%">
+</p>
+
 # BookMyShow Monitor
+
+<p align="center">
+  <a href="https://nodejs.org"><img src="https://img.shields.io/badge/node-%3E%3D18-brightgreen" alt="Node.js >= 18"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
+  <a href="https://playwright.dev"><img src="https://img.shields.io/badge/scraper-Playwright-45ba4b" alt="Playwright"></a>
+  <a href="https://wwebjs.dev"><img src="https://img.shields.io/badge/alerts-whatsapp--web.js-25D366" alt="whatsapp-web.js"></a>
+</p>
 
 A lightweight, backend-only Node.js service that continuously watches a BookMyShow
 "buy tickets" page and sends you a **WhatsApp alert** the moment new theatres,
