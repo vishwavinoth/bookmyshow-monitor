@@ -19,7 +19,7 @@
  */
 const { chromium } = require('playwright');
 const logger = require('./logger');
-const { config, movieNameFromUrl } = require('./utils');
+const { config, movieNameFromUrl, cityFromUrl } = require('./utils');
 
 const USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
@@ -369,8 +369,8 @@ function extractFromDom() {
 /* ── Snapshot assembly (Node side) ──────────────────────────────────── */
 
 /** Convert raw page data into the canonical snapshot shape (deduplicated). */
-function buildSnapshot(raw) {
-  const movie = config.movieName || raw.movie || movieNameFromUrl(config.targetUrl);
+function buildSnapshot(raw, targetUrl) {
+  const movie = config.movieName || raw.movie || movieNameFromUrl(targetUrl);
 
   const theatres = [];
   let showCount = 0;
@@ -407,7 +407,8 @@ function buildSnapshot(raw) {
   return {
     scannedAt: new Date().toISOString(),
     movie,
-    url: config.targetUrl,
+    url: targetUrl,
+    city: cityFromUrl(targetUrl),
     source: raw.source || 'unknown',
     theatreCount: theatres.length,
     showCount,
@@ -416,7 +417,7 @@ function buildSnapshot(raw) {
 }
 
 /**
- * Scrape the target page once and return a snapshot.
+ * Scrape one target page and return a snapshot.
  * Throws on navigation/browser errors (the monitor handles retries);
  * a page with zero venues is a *valid* result (bookings not open yet).
  *
@@ -429,7 +430,7 @@ function buildSnapshot(raw) {
  * repeat visits stop rendering showtimes. Fresh contexts are reliable and
  * nearly as fast because the Chromium process is already warm.)
  */
-async function scrape() {
+async function scrape(targetUrl) {
   const instance = await getBrowser();
   const context = await instance.newContext({
     userAgent: USER_AGENT,
@@ -450,7 +451,7 @@ async function scrape() {
       return route.continue();
     });
 
-    await target.goto(config.targetUrl, {
+    await target.goto(targetUrl, {
       waitUntil: 'domcontentloaded',
       timeout: config.navTimeout,
     });
@@ -459,13 +460,13 @@ async function scrape() {
 
     // Primary: structured state payload (covers ALL venues, even virtualized ones).
     let raw = await target.evaluate(extractFromState);
-    if (raw && raw.venues.length) return buildSnapshot(raw);
+    if (raw && raw.venues.length) return buildSnapshot(raw, targetUrl);
 
     // The state can hydrate a beat after domcontentloaded — give straggling
     // XHRs a bounded chance to settle, then try once more.
     await target.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
     raw = await target.evaluate(extractFromState);
-    if (raw && raw.venues.length) return buildSnapshot(raw);
+    if (raw && raw.venues.length) return buildSnapshot(raw, targetUrl);
 
     // Fallback: rendered DOM.
     await autoScroll(target);
@@ -478,7 +479,7 @@ async function scrape() {
       );
     }
 
-    return buildSnapshot(raw);
+    return buildSnapshot(raw, targetUrl);
   } finally {
     await context.close().catch(() => {});
   }

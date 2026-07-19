@@ -23,12 +23,19 @@
 const logger = require('./logger');
 const { scrape } = require('./scraper');
 const whatsapp = require('./whatsapp');
-const { config, sleep, diffSnapshots, formatAlertMessages } = require('./utils');
+const {
+  config,
+  sleep,
+  diffSnapshots,
+  formatAlertMessages,
+  cityFromUrl,
+  parseTimeToMinutes,
+} = require('./utils');
 
 const MAX_COOLDOWN_MS = 10 * 60 * 1000;
 
 const state = {
-  lastSnapshot: null, // latest successful scan (in-memory only)
+  snapshots: new Map(), // targetUrl -> latest successful snapshot (in-memory only)
   lastScanAt: null,
   lastScanStatus: 'idle', // idle | success | failed
   lastError: null,
@@ -42,7 +49,14 @@ let running = false;
 /* ── Scheduling ─────────────────────────────────────────────────────── */
 
 function start() {
-  logger.info(`Monitoring ${config.targetUrl}`);
+  for (const url of config.targetUrls) logger.info(`Monitoring ${url}`);
+  if (config.earlyShowsOnly) {
+    const h = Math.floor(config.earlyShowCutoff / 60);
+    const m = String(config.earlyShowCutoff % 60).padStart(2, '0');
+    logger.info(
+      `Alert filter active: only *Available* shows starting before ${h}:${m} (24h) trigger alerts`
+    );
+  }
   logger.info(
     `Continuous scan loop: next scan starts ${config.checkInterval}ms after the previous one finishes`
   );
@@ -72,12 +86,12 @@ function stop() {
 
 /* ── Scanning ───────────────────────────────────────────────────────── */
 
-/** Scrape with per-scan retries and exponential backoff. */
-async function scrapeWithRetry() {
+/** Scrape one target with per-scan retries and exponential backoff. */
+async function scrapeWithRetry(targetUrl) {
   let attempt = 0;
   for (;;) {
     try {
-      return await scrape();
+      return await scrape(targetUrl);
     } catch (err) {
       attempt += 1;
       if (attempt > config.maxRetries) throw err;
@@ -91,8 +105,92 @@ async function scrapeWithRetry() {
 }
 
 /**
- * Run one full scan: scrape -> diff -> notify -> store snapshot.
- * Never throws; failures are recorded in state and logged.
+ * The alert filter: only shows that are genuinely bookable *right now*
+ * ("Available" — not Sold Out, Fast Filling, Almost Full or Not Available)
+ * and, when EARLY_SHOWS_ONLY is set, only early/FDFS shows starting before
+ * the cutoff. Unparseable times fail open so an odd format never hides a
+ * potential FDFS alert.
+ */
+function passesAlertFilter(show) {
+  if (String(show.status).toLowerCase() !== 'available') return false;
+  if (config.earlyShowsOnly) {
+    const minutes = parseTimeToMinutes(show.time, null);
+    if (minutes !== null && minutes >= config.earlyShowCutoff) return false;
+  }
+  return true;
+}
+
+/** Scan a single target URL; returns { snapshot?, alertItems, summary }. */
+async function scanTarget(targetUrl) {
+  const snapshot = await scrapeWithRetry(targetUrl);
+  const previous = state.snapshots.get(targetUrl);
+  const label = snapshot.city || cityFromUrl(targetUrl) || targetUrl;
+
+  // A sudden empty result right after a healthy one is far more likely a
+  // transient page failure (or soft bot-block) than every single show
+  // vanishing. Keep the previous snapshot as the baseline — otherwise the
+  // shows "coming back" next scan would flood WhatsApp with false alerts.
+  if (previous && previous.showCount > 0 && snapshot.showCount === 0) {
+    logger.warn(
+      `[${label}] returned 0 shows while the previous scan had ${previous.showCount} — treating as transient, keeping previous snapshot`
+    );
+    return { alertItems: [], summary: { url: targetUrl, suspectEmpty: true } };
+  }
+
+  state.snapshots.set(targetUrl, snapshot);
+  logger.info(`[${label}] ${snapshot.theatreCount} theatre(s), ${snapshot.showCount} show(s)`);
+
+  if (!previous) {
+    logger.info(`[${label}] first scan — stored as baseline, no notifications sent`);
+    return {
+      snapshot,
+      alertItems: [],
+      summary: { url: targetUrl, baseline: true, theatres: snapshot.theatreCount, shows: snapshot.showCount },
+    };
+  }
+
+  const diff = diffSnapshots(previous, snapshot);
+  const candidates = [
+    ...diff.newShows,
+    ...diff.becameAvailable.map((s) => ({ ...s, note: `was ${s.previousStatus}` })),
+  ];
+  const kept = candidates.filter(passesAlertFilter);
+  const filteredOut = candidates.length - kept.length;
+
+  if (diff.newTheatres.length) {
+    logger.info(`[${label}] new theatres detected: ${diff.newTheatres.join(', ')}`);
+  }
+  for (const change of diff.otherChanges) {
+    logger.info(
+      `[${label}] status change (not alerted): ${change.theatre} ${change.time} — ${change.previousStatus} -> ${change.status}`
+    );
+  }
+  if (filteredOut > 0) {
+    logger.info(
+      `[${label}] ${filteredOut} change(s) suppressed by the alert filter (not Available, or after the early-show cutoff)`
+    );
+  }
+
+  return {
+    snapshot,
+    alertItems: kept.map((item) => ({ ...item, city: snapshot.city, pageUrl: snapshot.url })),
+    summary: {
+      url: targetUrl,
+      theatres: snapshot.theatreCount,
+      shows: snapshot.showCount,
+      newTheatres: diff.newTheatres.length,
+      newShows: diff.newShows.length,
+      becameAvailable: diff.becameAvailable.length,
+      alerted: kept.length,
+    },
+  };
+}
+
+/**
+ * Run one full scan cycle over every target page:
+ * scrape -> diff -> filter -> combine -> notify.
+ * Never throws; failures are recorded in state and logged. One page
+ * failing never stops the others from being scanned.
  */
 async function performScan(trigger = 'scheduled') {
   if (state.isScanning) {
@@ -105,76 +203,57 @@ async function performScan(trigger = 'scheduled') {
   logger.info(`Scan started (trigger: ${trigger})`);
 
   try {
-    const snapshot = await scrapeWithRetry();
-    const previous = state.lastSnapshot;
+    const results = [];
+    const alertItems = [];
+    let successes = 0;
+    let lastError = null;
+    let movie = config.movieName;
 
-    // A sudden empty result right after a healthy one is far more likely a
-    // transient page failure (or soft bot-block) than every single show
-    // vanishing. Keep the previous snapshot as the baseline — otherwise the
-    // shows "coming back" next scan would flood WhatsApp with false alerts.
-    if (previous && previous.showCount > 0 && snapshot.showCount === 0) {
-      state.lastScanAt = snapshot.scannedAt;
-      state.lastScanStatus = 'success';
-      state.scanCount += 1;
-      logger.warn(
-        `Scan returned 0 shows while the previous scan had ${previous.showCount} — treating as transient, keeping previous snapshot`
-      );
-      return { suspectEmpty: true, theatres: 0, shows: 0 };
+    for (const url of config.targetUrls) {
+      try {
+        const { snapshot, alertItems: items, summary } = await scanTarget(url);
+        successes += 1;
+        results.push(summary);
+        alertItems.push(...items);
+        if (snapshot && !movie) movie = snapshot.movie;
+      } catch (err) {
+        lastError = err;
+        results.push({ url, failed: true, error: err.message });
+        logger.error(`[${cityFromUrl(url) || url}] scan failed: ${err.message}`);
+      }
     }
 
-    state.lastSnapshot = snapshot;
-    state.lastScanAt = snapshot.scannedAt;
-    state.lastScanStatus = 'success';
-    state.lastError = null;
-    state.scanCount += 1;
-    state.consecutiveFailures = 0;
-
+    const totals = [...state.snapshots.values()].reduce(
+      (acc, s) => ({ theatres: acc.theatres + s.theatreCount, shows: acc.shows + s.showCount }),
+      { theatres: 0, shows: 0 }
+    );
     logger.info(
-      `Scan completed in ${((Date.now() - startedAt) / 1000).toFixed(1)}s: ${snapshot.theatreCount} theatre(s), ${snapshot.showCount} show(s) found`
+      `Scan completed in ${((Date.now() - startedAt) / 1000).toFixed(1)}s: ${totals.theatres} theatre(s), ${totals.shows} show(s) across ${successes}/${config.targetUrls.length} page(s)`
     );
 
-    if (!previous) {
-      logger.info('First scan — stored as baseline, no notifications sent');
-      return { baseline: true, theatres: snapshot.theatreCount, shows: snapshot.showCount };
-    }
-
-    const diff = diffSnapshots(previous, snapshot);
-    const alertItems = [
-      ...diff.newShows,
-      ...diff.becameAvailable.map((s) => ({ ...s, note: `was ${s.previousStatus}` })),
-    ];
-
-    if (diff.newTheatres.length) {
-      logger.info(`New theatres detected: ${diff.newTheatres.join(', ')}`);
-    }
-    for (const change of diff.otherChanges) {
-      logger.info(
-        `Status change (not alerted): ${change.theatre} ${change.time} — ${change.previousStatus} -> ${change.status}`
-      );
+    if (successes > 0) {
+      state.lastScanAt = new Date().toISOString();
+      state.lastScanStatus = 'success';
+      state.lastError = lastError ? lastError.message : null;
+      state.scanCount += 1;
+      state.consecutiveFailures = 0;
+    } else {
+      state.lastScanStatus = 'failed';
+      state.lastError = lastError ? lastError.message : 'all targets failed';
+      state.consecutiveFailures += 1;
+      logger.error(`Scan failed (${state.consecutiveFailures} consecutive): ${state.lastError}`);
+      return { failed: true, error: state.lastError, results };
     }
 
     if (alertItems.length) {
       logger.info(`New shows detected: ${alertItems.length} — sending WhatsApp alert`);
-      const messages = formatAlertMessages(snapshot.movie, alertItems);
+      const messages = formatAlertMessages(movie || 'BookMyShow', alertItems);
       await whatsapp.sendAlert(messages);
     } else {
-      logger.info('No new shows or availability changes detected');
+      logger.info('No alert-worthy new shows detected');
     }
 
-    return {
-      baseline: false,
-      theatres: snapshot.theatreCount,
-      shows: snapshot.showCount,
-      newTheatres: diff.newTheatres.length,
-      newShows: diff.newShows.length,
-      becameAvailable: diff.becameAvailable.length,
-    };
-  } catch (err) {
-    state.lastScanStatus = 'failed';
-    state.lastError = err.message;
-    state.consecutiveFailures += 1;
-    logger.error(`Scan failed (${state.consecutiveFailures} consecutive): ${err.message}`);
-    return { failed: true, error: err.message };
+    return { alerted: alertItems.length, results };
   } finally {
     state.isScanning = false;
   }
@@ -190,11 +269,21 @@ function getState() {
     scanCount: state.scanCount,
     isScanning: state.isScanning,
     consecutiveFailures: state.consecutiveFailures,
+    targets: config.targetUrls.length,
   };
 }
 
+/** All per-target snapshots, or null when nothing has been scanned yet. */
 function getSnapshot() {
-  return state.lastSnapshot;
+  if (!state.snapshots.size) return null;
+  const targets = [...state.snapshots.values()];
+  return {
+    scannedAt: state.lastScanAt,
+    targetCount: targets.length,
+    theatreCount: targets.reduce((n, s) => n + s.theatreCount, 0),
+    showCount: targets.reduce((n, s) => n + s.showCount, 0),
+    targets,
+  };
 }
 
 function isScanning() {

@@ -29,14 +29,55 @@ function parseRecipients(value) {
     .filter(Boolean);
 }
 
+/** Generic comma-separated list (used for TARGET_URLS). */
+function parseList(value) {
+  return String(value || '')
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+}
+
+/**
+ * "06:05 AM" / "9:30 PM" / "21:30" -> minutes since midnight, or the
+ * fallback when unparseable.
+ */
+function parseTimeToMinutes(value, fallback) {
+  const m = String(value || '')
+    .trim()
+    .match(/^(\d{1,2}):(\d{2})\s*(AM|PM)?$/i);
+  if (!m) return fallback;
+  let hours = parseInt(m[1], 10);
+  const minutes = parseInt(m[2], 10);
+  const meridiem = m[3] && m[3].toUpperCase();
+  if (meridiem === 'PM' && hours !== 12) hours += 12;
+  if (meridiem === 'AM' && hours === 12) hours = 0;
+  if (hours > 23 || minutes > 59) return fallback;
+  return hours * 60 + minutes;
+}
+
+/** City from a BMS URL: .../movies/<city>/<slug>/... -> "Coimbatore" */
+function cityFromUrl(url) {
+  const m = String(url).match(/\/movies\/([^/]+)\//);
+  if (!m) return null;
+  return m[1].charAt(0).toUpperCase() + m[1].slice(1);
+}
+
+const DEFAULT_TARGET =
+  'https://in.bookmyshow.com/movies/bengaluru/jana-nayagan/buytickets/ET00430817/20260723';
+
+const targetUrls = parseList(process.env.TARGET_URLS || process.env.TARGET_URL);
+
 const config = {
   port: toInt(process.env.PORT, 3000),
   // Gap between scans. Floored at 2s — below that you gain nothing but
   // dramatically raise the odds of being bot-blocked.
   checkInterval: Math.max(toInt(process.env.CHECK_INTERVAL, 10000), 2000),
-  targetUrl:
-    process.env.TARGET_URL ||
-    'https://in.bookmyshow.com/movies/bengaluru/jana-nayagan/buytickets/ET00430817/20260723',
+  // One or many pages to watch; TARGET_URL kept for backward compatibility.
+  targetUrls: targetUrls.length ? targetUrls : [DEFAULT_TARGET],
+  // Alert filtering: when enabled, only *Available* shows starting before
+  // the cutoff (FDFS / early-morning shows) trigger WhatsApp alerts.
+  earlyShowsOnly: toBool(process.env.EARLY_SHOWS_ONLY, false),
+  earlyShowCutoff: parseTimeToMinutes(process.env.EARLY_SHOW_CUTOFF, 12 * 60), // default noon
   // One or many recipients; WHATSAPP_NUMBER kept for backward compatibility.
   whatsappNumbers: parseRecipients(process.env.WHATSAPP_NUMBERS || process.env.WHATSAPP_NUMBER),
   headless: toBool(process.env.HEADLESS, true),
@@ -142,21 +183,24 @@ const MAX_MESSAGE_LENGTH = 3500; // stay well under WhatsApp limits
  * Build one or more WhatsApp messages for a list of alert items.
  * Items found in a single scan are combined; the list is split into
  * multiple messages only when it would get uncomfortably long.
- * Each item: { theatre, time, language, format, status, bookingUrl, note? }
+ * Each item: { theatre, time, language, format, status, bookingUrl,
+ *              city?, pageUrl?, note? }
  */
 function formatAlertMessages(movie, items) {
   const header = `🚨 *BookMyShow Alert*\n\n*Movie:* ${movie}\n_${items.length} new update(s) detected_`;
 
-  const blocks = items.map((item) =>
-    [
-      `*Theatre:*\n${item.theatre}`,
+  const blocks = items.map((item) => {
+    const lines = [`*Theatre:*\n${item.theatre}`];
+    if (item.city) lines.push(`*City:*\n${item.city}`);
+    lines.push(
       `*Time:*\n${item.time}`,
       `*Language:*\n${item.language}`,
       `*Format:*\n${item.format}`,
       `*Status:*\n${item.status}${item.note ? ` (${item.note})` : ''}`,
-      `*Booking:*\n${item.bookingUrl || config.targetUrl}`,
-    ].join('\n\n')
-  );
+      `*Booking:*\n${item.bookingUrl || item.pageUrl || config.targetUrls[0]}`
+    );
+    return lines.join('\n\n');
+  });
 
   const messages = [];
   let current = header;
@@ -178,6 +222,8 @@ module.exports = {
   sleep,
   normalize,
   movieNameFromUrl,
+  cityFromUrl,
+  parseTimeToMinutes,
   showKey,
   isBookable,
   diffSnapshots,

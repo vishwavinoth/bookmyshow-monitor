@@ -18,8 +18,13 @@ router.get('/health', (req, res) => {
   res.json({
     status: 'ok',
     uptimeSeconds: Math.round(process.uptime()),
-    targetUrl: config.targetUrl,
+    targetUrls: config.targetUrls,
     checkIntervalMs: config.checkInterval,
+    alertFilter: {
+      availableOnly: true,
+      earlyShowsOnly: config.earlyShowsOnly,
+      earlyShowCutoffMinutes: config.earlyShowCutoff,
+    },
     whatsapp: whatsapp.getStatus(),
     monitor: monitor.getState(),
     timestamp: new Date().toISOString(),
@@ -63,7 +68,7 @@ router.post('/test-alert', async (req, res) => {
       language: 'Tamil',
       format: 'TEST',
       status: 'Working ✅',
-      bookingUrl: config.targetUrl,
+      bookingUrl: config.targetUrls[0],
     },
   ]);
   await whatsapp.sendAlert(messages); // never throws; queues if not ready

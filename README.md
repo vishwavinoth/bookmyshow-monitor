@@ -75,7 +75,9 @@ Then edit `.env`:
 | ------------------ | ---------- | ------------------------------------------------------------------ |
 | `PORT`             | `3000`     | Port for the REST API                                               |
 | `CHECK_INTERVAL`   | `10000`    | Gap in **ms** between scans (min 2000). Detection latency ≈ interval + ~3s scan |
-| `TARGET_URL`       | (the Jana Nayagan page) | The BookMyShow buy-tickets page to watch               |
+| `TARGET_URLS`      | (the Jana Nayagan page) | Buy-tickets page(s) to watch, **comma-separated** for multiple cities/dates. Legacy `TARGET_URL` still works |
+| `EARLY_SHOWS_ONLY` | `false`    | When `true`, alert only for **Available** shows starting before the cutoff (FDFS/early shows). Sold Out / Fast Filling changes are logged, never alerted |
+| `EARLY_SHOW_CUTOFF`| `12:00 PM` | Latest start time that still counts as an "early show" (`9:00 AM`, `12:00 PM`, or 24h `21:30`) |
 | `WHATSAPP_NUMBERS` | —          | Recipients, **comma-separated**, digits only (e.g. `919876543210,918765432109`); group ids (`...@g.us`) allowed. `WHATSAPP_NUMBER` still works |
 | `HEADLESS`         | `true`     | Set `false` to watch the scraping browser (useful for debugging)   |
 | `MOVIE_NAME`       | scraped    | Optional display name used in alerts                                |
@@ -162,12 +164,18 @@ Only the **latest snapshot is kept in memory** (no database, no files):
 - A show's identity is the combination `theatre + time + language + format`.
 - The **first successful scan after startup becomes the baseline** — nothing
   is alerted for it. After a restart, the next scan is simply the new baseline.
+- Each target URL keeps its own snapshot and is diffed independently; alert
+  items from all pages are combined into one message, labelled with the city.
 - On every subsequent scan the new snapshot is diffed against the previous one:
   - **New theatres** → alerted (all their shows count as new shows)
   - **New show timings** → alerted
   - **Status flips to bookable** (e.g. `Sold Out → Available`) → alerted, with
     the previous status noted
   - Other status changes (e.g. `Available → Sold Out`) → logged only
+- An **alert filter** decides what actually reaches WhatsApp: only shows whose
+  status is `Available` qualify (Sold Out / Fast Filling / Not Available are
+  logged, never alerted), and with `EARLY_SHOWS_ONLY=true` only shows starting
+  before `EARLY_SHOW_CUTOFF` — the FDFS / early-morning shows — get through.
 - Duplicates within a scan are ignored, and unchanged shows are never
   re-alerted.
 - All new items found in a single scan are **combined into one WhatsApp
@@ -219,25 +227,35 @@ curl -X POST http://localhost:3000/scan
 curl -X POST http://localhost:3000/test-alert
 ```
 
-`GET /shows` response shape:
+`GET /shows` response shape (one entry in `targets` per monitored URL):
 
 ```json
 {
   "scannedAt": "2026-07-16T09:30:00.000Z",
-  "movie": "Jana Nayagan",
-  "url": "https://in.bookmyshow.com/movies/bengaluru/jana-nayagan/buytickets/ET00430817/20260723",
+  "targetCount": 1,
   "theatreCount": 2,
   "showCount": 5,
-  "theatres": [
+  "targets": [
     {
-      "name": "PVR: Nexus, Koramangala",
-      "shows": [
+      "scannedAt": "2026-07-16T09:30:00.000Z",
+      "movie": "Jana Nayagan",
+      "city": "Coimbatore",
+      "url": "https://in.bookmyshow.com/movies/coimbatore/jana-nayagan/buytickets/ET00430817/20260723",
+      "source": "state",
+      "theatreCount": 2,
+      "showCount": 5,
+      "theatres": [
         {
-          "time": "7:30 PM",
-          "language": "Tamil",
-          "format": "IMAX",
-          "status": "Available",
-          "bookingUrl": "https://in.bookmyshow.com/..."
+          "name": "PVR: Brookefields",
+          "shows": [
+            {
+              "time": "7:30 PM",
+              "language": "Tamil",
+              "format": "IMAX",
+              "status": "Available",
+              "bookingUrl": "https://in.bookmyshow.com/..."
+            }
+          ]
         }
       ]
     }
