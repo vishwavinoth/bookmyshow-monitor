@@ -217,7 +217,7 @@ https://in.bookmyshow.com/...
 | GET    | `/last-scan`  | Timestamp and outcome of the most recent scan |
 | GET    | `/shows`      | The latest scraped snapshot currently in memory |
 | POST   | `/scan`       | Trigger an immediate scan (waits for completion) |
-| POST   | `/test-alert` | Send a sample WhatsApp alert to verify delivery |
+| GET/POST | `/test-alert` | Send a sample WhatsApp alert to verify delivery (GET allowed so it works from a browser) |
 
 ```bash
 curl http://localhost:3000/health

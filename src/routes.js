@@ -5,7 +5,7 @@
  *   GET  /last-scan   — last scan timestamp + outcome
  *   GET  /shows       — latest in-memory snapshot
  *   POST /scan        — trigger an immediate scan (runs to completion)
- *   POST /test-alert  — send a sample WhatsApp alert to verify delivery
+ *   GET|POST /test-alert — send a sample WhatsApp alert to verify delivery
  */
 const express = require('express');
 const monitor = require('./monitor');
@@ -56,7 +56,8 @@ router.post('/scan', async (req, res, next) => {
   }
 });
 
-router.post('/test-alert', async (req, res) => {
+// Accepts GET as well so it can be triggered from a browser address bar.
+router.all('/test-alert', async (req, res) => {
   const messages = formatAlertMessages(`${config.movieName || 'Monitor'} — TEST`, [
     {
       theatre: 'Test Theatre (this is only a delivery test)',
